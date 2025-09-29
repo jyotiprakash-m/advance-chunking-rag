@@ -1,0 +1,15 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Include .env files if you use them for environment variables
+.env
+# Include all the folder starting with chroma_db
+chroma_db*/

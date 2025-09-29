@@ -1,0 +1,18 @@
+[project]
+name = "rag-simulator"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "agentic-chunker>=0.0.6",
+    "chromadb>=1.1.0",
+    "langchain>=0.3.27",
+    "langchain-experimental>=0.3.4",
+    "langchain-openai>=0.3.33",
+    "llama-index>=0.14.3",
+    "loadenv>=0.1.1",
+    "nltk>=3.9.1",
+    "pdfplumber>=0.11.7",
+    "pypdf2>=3.0.1",
+]
