@@ -2,8 +2,8 @@ import os
 import pdfplumber
 import nltk
 from dotenv import load_dotenv
-from langchain_openai.embeddings import OpenAIEmbeddings
-from langchain_chroma import Chroma
+# from langchain_openai.embeddings import OpenAIEmbeddings
+# from langchain_chroma import Chroma
 from langchain.docstore.document import Document
 from typing import List, Tuple
 from tqdm import tqdm
@@ -11,7 +11,7 @@ import concurrent.futures
 import time
 
 load_dotenv()
-
+ 
 # Download NLTK data only once
 try:
     nltk.data.find('tokenizers/punkt')
@@ -45,25 +45,24 @@ def process_page_text(page_data: Tuple[int, str]) -> List[Tuple[int, str]]:
     return blocks
 
 
-def extract_and_store_blocks_streaming(
+def extract_blocks_streaming(
     pdf_path: str,
-    collection_name: str = "bigfile_structural_blocks",
     max_workers: int = 4,
     batch_size: int = 50,
     page_batch_size: int = 100,
 ):
-    """Process all pages in batches, create blocks, and store them in ChromaDB."""
+    """Process all pages in batches, create blocks, but do NOT store or embed."""
     start_time = time.time()
     
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"PDF file not found: {pdf_path}")
     
-    embedding = OpenAIEmbeddings()
-    vectorstore = Chroma(
-        collection_name=collection_name,
-        embedding_function=embedding,
-        persist_directory="./chroma_db_bigfile"
-    )
+    # embedding = OpenAIEmbeddings()
+    # vectorstore = Chroma(
+    #     collection_name=collection_name,
+    #     embedding_function=embedding,
+    #     persist_directory="./chroma_db_bigfile"
+    # )
 
     with pdfplumber.open(pdf_path) as pdf:
         total_pages = len(pdf.pages)
@@ -87,7 +86,6 @@ def extract_and_store_blocks_streaming(
             ]
 
             # Process pages in parallel using ThreadPoolExecutor instead of ProcessPoolExecutor
-            # ThreadPoolExecutor is better for I/O-bound tasks and avoids pickling issues
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_page = {
                     executor.submit(process_page_text, pd): pd[0]
@@ -119,69 +117,40 @@ def extract_and_store_blocks_streaming(
                         block_index += 1
                         total_blocks_processed += 1
 
-                        # Store batch when buffer is full
+                        # Just count batches, do not store
                         if len(buffer) >= batch_size:
                             batch_count += 1
-                            vectorstore.add_documents(buffer)
+                            # vectorstore.add_documents(buffer)
                             buffer.clear()
 
         # Flush remaining blocks
         if buffer:
             batch_count += 1
-            vectorstore.add_documents(buffer)
-            print(f"💾 Stored final batch {batch_count} ({len(buffer)} blocks)")
+            # vectorstore.add_documents(buffer)
+            print(f"💾 Processed final batch {batch_count} ({len(buffer)} blocks)")
 
     end_time = time.time()
     total_time = end_time - start_time
     
     print(f"\n✅ Processing complete!")
     print(f"📊 Total blocks created: {total_blocks_processed}")
-    print(f"📦 Total batches stored: {batch_count}")
-    print(f"💾 Data persisted to: './chroma_db_bigfile'")
+    print(f"📦 Total batches processed: {batch_count}")
     print(f"⏱️ Total processing time: {total_time:.2f} seconds")
     print(f"⚡ Average speed: {total_blocks_processed / total_time:.2f} blocks/second")
     
-    return vectorstore
-
-
-def query_vectorstore(
-    query: str,
-    collection_name: str = "bigfile_structural_blocks",
-    k: int = 5
-):
-    """Query the vectorstore with a given question."""
-    embedding = OpenAIEmbeddings()
-    vectorstore = Chroma(
-        collection_name=collection_name,
-        embedding_function=embedding,
-        persist_directory="./chroma_db_bigfile"
-    )
-    
-    results = vectorstore.similarity_search(query, k=k)
-    
-    print(f"\n🔍 Query: {query}")
-    print(f"📋 Top {k} results:\n")
-    
-    for i, doc in enumerate(results, 1):
-        print(f"Result {i}:")
-        print(f"Page: {doc.metadata.get('page_number', 'N/A')}")
-        print(f"Content: {doc.page_content[:200]}...")
-        print(f"Block Index: {doc.metadata.get('block_index', 'N/A')}\n")
-    
-    return results
+    return buffer
 
 
 if __name__ == "__main__":
-    # pdf_path = "/Users/jyotiprakash/Desktop/python/rag-simulator/study-research/sliding-window/Resume JPM.pdf"
     pdf_path = "/Users/jyotiprakash/Desktop/python/rag-simulator/big_file/bigfile.pdf"  # Replace with your actual PDF path
     
-    # Process and store
-    vectorstore = extract_and_store_blocks_streaming(
+    # Only process and list blocks, do NOT store or create embeddings
+    blocks = extract_blocks_streaming(
         pdf_path, 
         max_workers=4, 
         batch_size=50, 
         page_batch_size=100
     )
-    
-    # Example query (uncomment to test)
-    # query_vectorstore("What are the key qualifications?", k=3)
+    print(f"\nSample processed blocks (first 3):")
+    for doc in blocks[:3]:
+        print(f"Page {doc.metadata['page_number']} | Block {doc.metadata['block_index']}: {doc.page_content[:100]}...")
