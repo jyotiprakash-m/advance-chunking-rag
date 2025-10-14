@@ -23,7 +23,7 @@ start_services() {
     # Development mode (with Redis commander)
     if [ "$1" = "dev" ]; then
         echo "🔧 Starting in development mode..."
-        docker compose --profile debug up --build -d
+        COMPOSE_PROFILES=debug docker compose up --build -d
     # Production mode
     elif [ "$1" = "prod" ]; then
         echo "🚀 Starting in production mode..."
@@ -78,6 +78,15 @@ check_health() {
         echo "✅ Redis is healthy"
     else
         echo "❌ Redis is not healthy"
+    fi
+    
+    # Check Redis Commander (if running)
+    echo "Checking Redis Commander..."
+    if curl -f http://localhost:8081 > /dev/null 2>&1; then
+        echo "✅ Redis Commander is running at http://localhost:8081"
+        echo "   Username: admin, Password: secret"
+    else
+        echo "ℹ️  Redis Commander is not running (use 'dev' mode to start)"
     fi
 }
 

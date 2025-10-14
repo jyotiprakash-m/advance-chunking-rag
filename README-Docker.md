@@ -20,7 +20,7 @@ This document explains how to run the RAG Chunking Service using Docker containe
 ./docker-start.sh start dev
 ```
 
-This includes Redis Commander UI at http://localhost:8081
+This includes Redis Commander UI at http://localhost:8081 (admin/secret)
 
 ### 2. Start in Production Mode
 
@@ -76,7 +76,7 @@ LOG_LEVEL=INFO
 - **API**: http://localhost:8000
 - **Health Check**: http://localhost:8000/health
 - **WebSocket Progress**: ws://localhost:8000/v1/operations/progress/{task_id}
-- **Redis Commander** (dev only): http://localhost:8081
+- **Redis Commander** (dev only): http://localhost:8081 (admin/secret)
 
 ## 📊 Production Features
 
@@ -185,6 +185,21 @@ docker-compose logs rag-api
 
 # Monitor resource usage
 docker stats rag-chunking-api
+```
+
+### Redis Commander Issues
+
+```bash
+# Check if Redis Commander is running (dev mode only)
+docker compose ps redis-commander
+
+# Check Redis Commander logs
+docker compose logs redis-commander
+
+# Access Redis Commander
+# URL: http://localhost:8081
+# Username: admin
+# Password: secret
 ```
 
 ### Queue Management
