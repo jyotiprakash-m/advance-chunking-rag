@@ -33,3 +33,9 @@ class StructuralBlockResponse(BaseModel):
     processing_time: float
     metadata: Optional[Dict[str, Any]] = None
     length_function_used: Optional[str] = None
+
+class TaskInitiationResponse(BaseModel):
+    """Response model for task initiation."""
+    task_id: str
+    status: str
+    message: str

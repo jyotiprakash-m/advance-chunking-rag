@@ -31,9 +31,12 @@ from modals.request_response import StructuralBlockRequest, StructuralBlockRespo
 
 # Supported file formats
 SUPPORTED_FORMATS = ['.pdf', '.txt', '.pptx', '.ppt', '.docx', '.doc', '.html', '.htm', '.xml']
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB limit
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 10MB limit
 
-async def process_structural_chunking(request: StructuralBlockRequest) -> StructuralBlockResponse:
+# In-memory storage for progress (use Redis in production)
+progress_store = {}
+
+async def process_structural_chunking(request: StructuralBlockRequest, task_id: Optional[str] = None) -> StructuralBlockResponse:
         """
         Process structural block chunking based on the request parameters.
         
@@ -50,8 +53,11 @@ async def process_structural_chunking(request: StructuralBlockRequest) -> Struct
             progress["current"] = step
             progress["message"] = message
             logger.info(f"Progress: {step}% - {message}")
+            if task_id:
+                progress_store[task_id] = {"current": step, "total": 100, "message": message}
         
         try:
+            update_progress(5, "Initializing processing")
             update_progress(10, "Determining text source")
             # Determine text source: direct text or file
             if request.text:
@@ -59,7 +65,9 @@ async def process_structural_chunking(request: StructuralBlockRequest) -> Struct
                 filename = "direct_text.txt"
                 file_extension = ".txt"
                 logger.info("Using direct text input")
+                update_progress(15, "Direct text input detected")
             elif request.file:
+                update_progress(15, "File input detected")
                 # Validate file format
                 filename = request.file.filename or "unknown.txt"
                 file_extension = get_file_extension(filename)
@@ -70,6 +78,7 @@ async def process_structural_chunking(request: StructuralBlockRequest) -> Struct
                         detail=f"Unsupported file format. Supported formats: {', '.join(SUPPORTED_FORMATS)}"
                     )
                 
+                update_progress(20, "Validating file")
                 # Check file size
                 file_size = len(await request.file.read())
                 await request.file.seek(0)  # Reset file pointer
@@ -80,23 +89,26 @@ async def process_structural_chunking(request: StructuralBlockRequest) -> Struct
                         detail=f"File size exceeds limit of {MAX_FILE_SIZE} bytes"
                     )
                 
-                update_progress(30, f"Extracting text from {filename}")
+                update_progress(25, f"Reading file: {filename}")
                 # Extract text from uploaded file
                 logger.info(f"Extracting text from file: {filename}")
                 text_content = await extract_text_from_file(request.file, file_extension)
+                update_progress(40, "Text extraction completed")
             else:
                 logger.error("Neither file nor text provided")
                 raise HTTPException(status_code=400, detail="Either file or text must be provided.")
             
-            update_progress(50, "Text extracted, configuring splitter")
+            update_progress(50, "Configuring text splitter")
             logger.info(f"Text extracted, length: {len(text_content)} characters")
             # Configure text splitter based on request parameters
             text_splitter = configure_text_splitter(request)
+            update_progress(60, "Splitter configured")
             
-            update_progress(70, "Splitting text into chunks")
+            update_progress(70, "Starting text splitting")
             # Split text into chunks
             logger.info("Splitting text into chunks")
             documents = text_splitter.split_text(text_content)
+            update_progress(80, "Text splitting completed")
             
             # Convert to Document objects with metadata
             chunks = create_document_chunks(documents, filename)
@@ -124,7 +136,7 @@ async def process_structural_chunking(request: StructuralBlockRequest) -> Struct
             processing_time = time.time() - start_time
             update_progress(100, "Processing complete")
             
-            return StructuralBlockResponse(
+            response = StructuralBlockResponse(
                 status="success",
                 message=f"Successfully processed {len(chunks)} structural blocks",
                 total_chunks=len(chunks),
@@ -144,12 +156,24 @@ async def process_structural_chunking(request: StructuralBlockRequest) -> Struct
                 }
             )
             
+            # Store the complete result in progress_store for WebSocket
+            if task_id:
+                progress_store[task_id] = {
+                    "current": 100, 
+                    "total": 100, 
+                    "message": "Processing complete",
+                    "result": response.dict()  # Convert to dict for JSON serialization
+                }
+            
+            return response
+            
         except Exception as e:
             processing_time = time.time() - start_time
             progress["current"] = 0
             progress["message"] = f"Error: {str(e)}"
             logger.error(f"Error processing request: {str(e)}")
-            return StructuralBlockResponse(
+            
+            error_response = StructuralBlockResponse(
                 status="error",
                 message=f"Error processing file: {str(e)}",
                 total_chunks=0,
@@ -158,6 +182,17 @@ async def process_structural_chunking(request: StructuralBlockRequest) -> Struct
                 length_function_used=request.length_function or "characters",
                 metadata={"error": str(e), "progress": progress}
             )
+            
+            # Store error result in progress_store
+            if task_id:
+                progress_store[task_id] = {
+                    "current": 0, 
+                    "total": 100, 
+                    "message": f"Error: {str(e)}",
+                    "result": error_response.dict()
+                }
+            
+            return error_response
     
 def get_file_extension(filename: str) -> str:
     """Extract file extension from filename."""
