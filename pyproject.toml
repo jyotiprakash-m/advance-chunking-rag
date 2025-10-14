@@ -7,12 +7,15 @@ requires-python = ">=3.13"
 dependencies = [
     "agentic-chunker>=0.0.6",
     "chromadb>=1.1.0",
+    "fastapi>=0.118.0",
     "langchain>=0.3.27",
     "langchain-experimental>=0.3.4",
     "langchain-openai>=0.3.33",
+    "langchain-text-splitters>=0.3.11",
     "llama-index>=0.14.3",
     "loadenv>=0.1.1",
     "nltk>=3.9.1",
     "pdfplumber>=0.11.7",
     "pypdf2>=3.0.1",
+    "python-multipart>=0.0.20",
 ]
