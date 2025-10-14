@@ -1,0 +1,64 @@
+services:
+  # Redis service for progress storage
+  redis:
+    image: redis:7-alpine
+    container_name: rag-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  # RAG Chunking API service
+  rag-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-chunking-api
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - MAX_CONCURRENT_TASKS=5
+      - PROCESSING_QUEUE_SIZE=10
+      - MAX_FILE_SIZE=104857600 # 100MB
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./logs:/app/logs # Mount logs directory
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  # Optional: Redis Commander for Redis management UI
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: rag-redis-commander
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    restart: unless-stopped
+    profiles: ["debug"] # Only start with --profile debug
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  default:
+    name: rag-network

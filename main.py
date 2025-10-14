@@ -17,6 +17,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # functionality of chunking
 app.include_router(structural_block_router, prefix="/v1")
 
@@ -26,7 +27,8 @@ def read_root():
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy"}
+    """Health check endpoint for Docker container monitoring."""
+    return {"status": "healthy", "service": "rag-chunking-api"}
 
 
 def main():

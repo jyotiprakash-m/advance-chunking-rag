@@ -2,7 +2,10 @@ import time
 import logging
 import tiktoken
 import asyncio
+import json
 from concurrent.futures import ThreadPoolExecutor
+from asyncio import Queue, Semaphore
+import redis.asyncio as redis
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_text_splitters import Language
 from langchain.docstore.document import Document
@@ -40,125 +43,187 @@ STREAM_CHUNK_SIZE = 1024 * 1024  # 1MB chunks for streaming
 MAX_PARALLEL_WORKERS = 4  # Maximum parallel processing workers
 PROGRESS_UPDATE_INTERVAL = 0.1  # Progress update interval in seconds
 
-# In-memory storage for progress (use Redis in production)
-progress_store = {}
+# Concurrency and queue limits
+MAX_CONCURRENT_TASKS = 5  # Maximum concurrent processing tasks
+PROCESSING_QUEUE_SIZE = 10  # Maximum queue size for waiting tasks
+REDIS_PROGRESS_TTL = 3600  # Progress data TTL in Redis (1 hour)
+
+# Global processing queue and semaphore
+processing_queue = Queue(maxsize=PROCESSING_QUEUE_SIZE)
+processing_semaphore = Semaphore(MAX_CONCURRENT_TASKS)
+
+# Redis client for progress storage (fallback to in-memory if Redis unavailable)
+redis_client = None
+progress_store = {}  # Fallback in-memory store
+
+async def init_redis():
+    """Initialize Redis connection for progress storage."""
+    global redis_client
+    try:
+        # Use environment variable for Redis URL with fallback
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+        redis_client = redis.from_url(redis_url, decode_responses=True)
+        await redis_client.ping()
+        logger.info(f"Redis connected successfully at {redis_url}")
+    except Exception as e:
+        logger.warning(f"Redis connection failed, using in-memory storage: {str(e)}")
+        redis_client = None
+
+async def set_progress(task_id: str, progress_data: dict):
+    """Set progress data in Redis or fallback to in-memory."""
+    if redis_client:
+        try:
+            await redis_client.setex(
+                f"progress:{task_id}", 
+                REDIS_PROGRESS_TTL, 
+                json.dumps(progress_data)
+            )
+        except Exception as e:
+            logger.warning(f"Redis set failed, using fallback: {str(e)}")
+            progress_store[task_id] = progress_data
+    else:
+        progress_store[task_id] = progress_data
+
+async def get_progress(task_id: str) -> dict:
+    """Get progress data from Redis or fallback to in-memory."""
+    if redis_client:
+        try:
+            data = await redis_client.get(f"progress:{task_id}")
+            if data:
+                return json.loads(data)
+        except Exception as e:
+            logger.warning(f"Redis get failed, using fallback: {str(e)}")
+    
+    return progress_store.get(task_id, {})
 
 async def process_structural_chunking(request: StructuralBlockRequest, task_id: Optional[str] = None) -> StructuralBlockResponse:
         """
-        Process structural block chunking with streaming and parallel processing.
+        Process structural block chunking with streaming, parallel processing, and queue management.
         
         Args:
             request: StructuralBlockRequest containing all chunking parameters
+            task_id: Optional task ID for progress tracking
             
         Returns:
             StructuralBlockResponse with chunking results
         """
+        # Initialize Redis if not already done
+        if redis_client is None:
+            await init_redis()
+        
         start_time = time.time()
         progress = {"current": 0, "total": 100, "message": "Starting processing"}
         
-        def update_progress(step: int, message: str):
+        async def update_progress(step: int, message: str):
             progress["current"] = step
             progress["message"] = message
-            logger.info(f"Progress: {step}% - {message}")
+            progress["timestamp"] = time.time()
+            logger.info(f"Task {task_id}: {step}% - {message}")
             if task_id:
-                progress_store[task_id] = {"current": step, "total": 100, "message": message}
+                await set_progress(task_id, {"current": step, "total": 100, "message": message, "timestamp": time.time()})
+        
+        # Wait for processing slot (queue management)
+        await update_progress(1, "Waiting in queue...")
+        await processing_queue.put(task_id)  # Add to queue
         
         try:
-            update_progress(2, "Initializing processing")
-            await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)  # Allow progress to be visible
-            
-            update_progress(5, "Determining text source")
-            await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
-            
-            # Determine text source: direct text or file
-            if request.text:
-                text_content = request.text
-                filename = "direct_text.txt"
-                file_extension = ".txt"
-                logger.info("Using direct text input")
-                update_progress(10, "Direct text input detected")
+            # Acquire semaphore for concurrent processing limit
+            async with processing_semaphore:
+                await update_progress(2, "Processing slot acquired, initializing...")
                 await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
                 
-            elif request.file:
-                update_progress(8, "File input detected")
+                await update_progress(5, "Determining text source")
                 await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
                 
-                # Validate file format
-                filename = request.file.filename or "unknown.txt"
-                file_extension = get_file_extension(filename)
-                if file_extension not in SUPPORTED_FORMATS:
-                    logger.error(f"Unsupported file format: {file_extension}")
-                    raise HTTPException(
-                        status_code=400, 
-                        detail=f"Unsupported file format. Supported formats: {', '.join(SUPPORTED_FORMATS)}"
-                    )
+                # Determine text source: direct text or file
+                if request.text:
+                    text_content = request.text
+                    filename = "direct_text.txt"
+                    file_extension = ".txt"
+                    logger.info("Using direct text input")
+                    await update_progress(10, "Direct text input detected")
+                    await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+                    
+                elif request.file:
+                    await update_progress(8, "File input detected")
+                    await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+                    
+                    # Validate file format
+                    filename = request.file.filename or "unknown.txt"
+                    file_extension = get_file_extension(filename)
+                    if file_extension not in SUPPORTED_FORMATS:
+                        logger.error(f"Unsupported file format: {file_extension}")
+                        raise HTTPException(
+                            status_code=400, 
+                            detail=f"Unsupported file format. Supported formats: {', '.join(SUPPORTED_FORMATS)}"
+                        )
+                    
+                    await update_progress(12, "Validating file")
+                    await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+                    
+                    # Check file size
+                    file_size = len(await request.file.read())
+                    await request.file.seek(0)  # Reset file pointer
+                    if file_size > MAX_FILE_SIZE:
+                        logger.error(f"File too large: {file_size} bytes")
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"File size exceeds limit of {MAX_FILE_SIZE} bytes"
+                        )
+                    
+                    await update_progress(15, f"Reading file: {filename} ({file_size} bytes)")
+                    await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+                    
+                    # Stream and extract text from uploaded file with parallel processing
+                    logger.info(f"Streaming and extracting text from file: {filename}")
+                    text_content = await stream_extract_text_from_file(request.file, file_extension, task_id, update_progress)
+                    await update_progress(45, "Text extraction completed")
+                    await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+                    
+                else:
+                    logger.error("Neither file nor text provided")
+                    raise HTTPException(status_code=400, detail="Either file or text must be provided.")
                 
-                update_progress(12, "Validating file")
+                await update_progress(50, "Configuring text splitter")
                 await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
                 
-                # Check file size
-                file_size = len(await request.file.read())
-                await request.file.seek(0)  # Reset file pointer
-                if file_size > MAX_FILE_SIZE:
-                    logger.error(f"File too large: {file_size} bytes")
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"File size exceeds limit of {MAX_FILE_SIZE} bytes"
-                    )
-                
-                update_progress(15, f"Reading file: {filename} ({file_size} bytes)")
+                logger.info(f"Text extracted, length: {len(text_content)} characters")
+                # Configure text splitter based on request parameters
+                text_splitter = configure_text_splitter(request)
+                await update_progress(55, "Splitter configured")
                 await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
                 
-                # Stream and extract text from uploaded file with parallel processing
-                logger.info(f"Streaming and extracting text from file: {filename}")
-                text_content = await stream_extract_text_from_file(request.file, file_extension, task_id, update_progress)
-                update_progress(45, "Text extraction completed")
+                await update_progress(60, "Starting parallel text splitting")
                 await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
                 
-            else:
-                logger.error("Neither file nor text provided")
-                raise HTTPException(status_code=400, detail="Either file or text must be provided.")
-            
-            update_progress(50, "Configuring text splitter")
-            await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
-            
-            logger.info(f"Text extracted, length: {len(text_content)} characters")
-            # Configure text splitter based on request parameters
-            text_splitter = configure_text_splitter(request)
-            update_progress(55, "Splitter configured")
-            await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
-            
-            update_progress(60, "Starting parallel text splitting")
-            await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
-            
-            # Split text into chunks with parallel processing
-            logger.info("Splitting text into chunks with parallel processing")
-            chunks = await parallel_split_text(text_content, text_splitter, task_id, update_progress)
-            update_progress(85, "Text splitting completed")
-            await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
-            
-            # Convert to Document objects with metadata
-            update_progress(90, "Creating document chunks")
-            await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
-            
-            chunks = await asyncio.get_event_loop().run_in_executor(
-                None, create_document_chunks, chunks, filename
-            )
-            
-            # Apply chunk limit if specified
-            if request.return_chunk_limit:
-                chunks = chunks[:request.return_chunk_limit]
-                logger.info(f"Limited to {len(chunks)} chunks")
-            
-            update_progress(95, "Preparing response")
-            await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
-            
-            logger.info(f"Successfully processed {len(chunks)} chunks")
-            # Prepare response data with parallel processing
-            chunk_data = await parallel_process_chunks(chunks, task_id, update_progress)
-            
-            processing_time = time.time() - start_time
-            update_progress(100, "Processing complete")
+                # Split text into chunks with parallel processing
+                logger.info("Splitting text into chunks with parallel processing")
+                chunks = await parallel_split_text(text_content, text_splitter, task_id, update_progress)
+                await update_progress(85, "Text splitting completed")
+                await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+                
+                # Convert to Document objects with metadata
+                await update_progress(90, "Creating document chunks")
+                await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+                
+                chunks = await asyncio.get_event_loop().run_in_executor(
+                    None, create_document_chunks, chunks, filename
+                )
+                
+                # Apply chunk limit if specified
+                if request.return_chunk_limit:
+                    chunks = chunks[:request.return_chunk_limit]
+                    logger.info(f"Limited to {len(chunks)} chunks")
+                
+                await update_progress(95, "Preparing response")
+                await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+                
+                logger.info(f"Successfully processed {len(chunks)} chunks")
+                # Prepare response data with parallel processing
+                chunk_data = await parallel_process_chunks(chunks, task_id, update_progress)
+                
+                processing_time = time.time() - start_time
+                await update_progress(100, "Processing complete")
             
             response = StructuralBlockResponse(
                 status="success",
@@ -181,14 +246,15 @@ async def process_structural_chunking(request: StructuralBlockRequest, task_id: 
                 }
             )
             
-            # Store the complete result in progress_store for WebSocket
+            # Store the complete result in Redis/progress store for WebSocket
             if task_id:
-                progress_store[task_id] = {
+                await set_progress(task_id, {
                     "current": 100, 
                     "total": 100, 
                     "message": "Processing complete",
-                    "result": response.dict()  # Convert to dict for JSON serialization
-                }
+                    "result": response.dict(),  # Convert to dict for JSON serialization
+                    "timestamp": time.time()
+                })
             
             return response
             
@@ -208,16 +274,23 @@ async def process_structural_chunking(request: StructuralBlockRequest, task_id: 
                 metadata={"error": str(e), "progress": progress}
             )
             
-            # Store error result in progress_store
+            # Store error result in Redis/progress store
             if task_id:
-                progress_store[task_id] = {
+                await set_progress(task_id, {
                     "current": 0, 
                     "total": 100, 
                     "message": f"Error: {str(e)}",
-                    "result": error_response.dict()
-                }
+                    "result": error_response.dict(),
+                    "timestamp": time.time()
+                })
             
             return error_response
+        finally:
+            # Remove from queue when done (whether success or failure)
+            try:
+                processing_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
     
 async def stream_extract_text_from_file(file: UploadFile, file_extension: str, task_id: Optional[str], update_progress) -> str:
     """Stream and extract text from file with progress updates."""

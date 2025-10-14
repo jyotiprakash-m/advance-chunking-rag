@@ -1,0 +1,12 @@
+fastapi>=0.118.0
+python-multipart>=0.0.20
+uvicorn[standard]>=0.32.0
+redis>=6.4.0
+langchain>=0.3.27
+langchain-text-splitters>=0.3.11
+langchain-community>=0.3.23
+tiktoken>=0.8.0
+pypdf>=5.1.0
+unstructured>=0.16.0
+pydantic>=2.9.0
+aiofiles>=24.0.0

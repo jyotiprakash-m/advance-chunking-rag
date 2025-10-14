@@ -18,4 +18,5 @@ dependencies = [
     "pdfplumber>=0.11.7",
     "pypdf2>=3.0.1",
     "python-multipart>=0.0.20",
+    "redis>=6.4.0",
 ]
