@@ -35,12 +35,37 @@ async def progress_websocket(websocket: WebSocket, task_id: str):
 @router.post(
     "/structural-block",
     response_model=TaskInitiationResponse,
-    summary="Chunk documents using structural block strategy",
+    summary="Chunk documents using structural block strategy (JSON)",
 )
 async def structural_block_chunking_api(
     background_tasks: BackgroundTasks,
-    file: Optional[UploadFile] = File(None, description="Input document (.pdf, .txt, etc.) - optional if text is provided"),
-    text: Optional[str] = Query(None, description="Direct text input - optional if file is provided"),
+    request: StructuralBlockRequest,
+):
+    """Perform structural block chunking on text with Redis-backed progress tracking."""
+    
+    # Initialize Redis if not already done
+    await init_redis()
+    
+    task_id = str(uuid.uuid4())  # Generate unique task ID
+    await set_progress(task_id, {"current": 0, "total": 100, "message": "Task queued"})
+
+    # Run processing in background with queue management
+    background_tasks.add_task(process_with_progress, request, task_id)
+    
+    return TaskInitiationResponse(
+        task_id=task_id,
+        status="processing",
+        message=f"Processing started with queue management. Max concurrent: 5, Queue size: 10. Use WebSocket at /operations/progress/{task_id} for real-time updates."
+    )
+
+@router.post(
+    "/structural-block/file",
+    response_model=TaskInitiationResponse,
+    summary="Chunk documents using structural block strategy (File Upload)",
+)
+async def structural_block_chunking_file_api(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(..., description="Input document (.pdf, .txt, etc.)"),
     chunk_size: int = Query(1000, ge=1, description="Max size per chunk"),
     chunk_overlap: int = Query(200, ge=0, description="Overlap between chunks"),
     separators: Optional[List[str]] = Query(None, description="Custom separators"),
@@ -53,17 +78,18 @@ async def structural_block_chunking_api(
     language: Optional[Literal["python", "javascript", "typescript", "java", "cpp", "c", "csharp", "go", "rust", "ruby", "php", "scala", "kotlin", "swift", "r", "matlab", "shell", "sql", "html", "css", "xml", "json", "yaml"]] = Query(None, description="Programming language for code-aware chunking (optional)"),
     return_chunk_limit: Optional[int] = Query(None, ge=1, description="Limit number of chunks returned"),
 ):
-    """Perform structural block chunking on a document or text with Redis-backed progress tracking."""
+    """Perform structural block chunking on uploaded files with Redis-backed progress tracking."""
     
     # Initialize Redis if not already done
     await init_redis()
     
     task_id = str(uuid.uuid4())  # Generate unique task ID
     await set_progress(task_id, {"current": 0, "total": 100, "message": "Task queued"})
-    
+
+    # Create request object for file processing
     request = StructuralBlockRequest(
         file=file,
-        text=text,
+        text=None,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         separators=separators,

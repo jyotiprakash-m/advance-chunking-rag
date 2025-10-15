@@ -3,6 +3,7 @@ import logging
 import tiktoken
 import asyncio
 import json
+import gzip
 from concurrent.futures import ThreadPoolExecutor
 from asyncio import Queue, Semaphore
 import redis.asyncio as redis
@@ -41,60 +42,172 @@ MAX_FILE_SIZE = 100 * 1024 * 1024  # 10MB limit
 # Streaming and parallel processing constants
 STREAM_CHUNK_SIZE = 1024 * 1024  # 1MB chunks for streaming
 MAX_PARALLEL_WORKERS = 4  # Maximum parallel processing workers
-PROGRESS_UPDATE_INTERVAL = 0.1  # Progress update interval in seconds
+PROGRESS_UPDATE_INTERVAL = 0.5  # Progress update interval - optimized for Redis load
+WEBSOCKET_POLL_INTERVAL = 1.0  # WebSocket polling interval
 
 # Concurrency and queue limits
 MAX_CONCURRENT_TASKS = 5  # Maximum concurrent processing tasks
 PROCESSING_QUEUE_SIZE = 10  # Maximum queue size for waiting tasks
 REDIS_PROGRESS_TTL = 3600  # Progress data TTL in Redis (1 hour)
 
+# Redis optimization settings
+PROGRESS_UPDATE_THRESHOLD = 2  # Only update Redis when progress changes by 2%
+REDIS_BATCH_SIZE = 5  # Batch multiple Redis operations
+ENABLE_COMPRESSION = False  # Disable compression temporarily to fix decode issue
+
 # Global processing queue and semaphore
 processing_queue = Queue(maxsize=PROCESSING_QUEUE_SIZE)
 processing_semaphore = Semaphore(MAX_CONCURRENT_TASKS)
 
-# Redis client for progress storage (fallback to in-memory if Redis unavailable)
+# Redis client for progress storage
 redis_client = None
-progress_store = {}  # Fallback in-memory store
 
 async def init_redis():
-    """Initialize Redis connection for progress storage."""
+    """Initialize optimized Redis connection for progress storage."""
     global redis_client
+    # Use environment variable for Redis URL with fallback
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    logger.info(f"Attempting to connect to Redis at: {redis_url}")
+    
     try:
-        # Use environment variable for Redis URL with fallback
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-        redis_client = redis.from_url(redis_url, decode_responses=True)
+        # Create optimized Redis connection with connection pooling
+        redis_client = redis.from_url(
+            redis_url,
+            encoding="utf-8",
+            decode_responses=True,
+            max_connections=20,  # Connection pool size
+            retry_on_timeout=True,
+            health_check_interval=30,  # Health check every 30 seconds
+            socket_keepalive=True
+        )
+        
+        # Test the connection
         await redis_client.ping()
-        logger.info(f"Redis connected successfully at {redis_url}")
+        logger.info("✅ Redis connection established successfully")
+        return True
+        
     except Exception as e:
-        logger.warning(f"Redis connection failed, using in-memory storage: {str(e)}")
+        logger.error(f"❌ Failed to connect to Redis: {str(e)}")
         redis_client = None
+        raise RuntimeError(f"Redis connection failed: {str(e)}. Service cannot start without Redis.")
 
 async def set_progress(task_id: str, progress_data: dict):
-    """Set progress data in Redis or fallback to in-memory."""
-    if redis_client:
-        try:
+    """Set progress data in Redis with optimization."""
+    if not redis_client:
+        raise RuntimeError("Redis client not initialized. Progress storage unavailable.")
+        
+    try:
+        # Compress large result data
+        if "result" in progress_data and ENABLE_COMPRESSION:
+            result_data = progress_data.pop("result")
+            compressed_result = gzip.compress(json.dumps(result_data).encode())
+            
+            # Store progress and result separately
+            pipe = redis_client.pipeline()
+            pipe.setex(f"progress:{task_id}", REDIS_PROGRESS_TTL, json.dumps(progress_data))
+            pipe.setex(f"result:{task_id}", REDIS_PROGRESS_TTL, compressed_result)
+            await pipe.execute()
+        else:
             await redis_client.setex(
                 f"progress:{task_id}", 
                 REDIS_PROGRESS_TTL, 
                 json.dumps(progress_data)
             )
-        except Exception as e:
-            logger.warning(f"Redis set failed, using fallback: {str(e)}")
-            progress_store[task_id] = progress_data
-    else:
-        progress_store[task_id] = progress_data
+            
+        # Publish progress update for real-time WebSocket
+        await redis_client.publish(f"progress_channel:{task_id}", json.dumps(progress_data))
+        
+    except Exception as e:
+        logger.error(f"Redis set failed: {str(e)}")
+        raise RuntimeError(f"Failed to store progress in Redis: {str(e)}")
 
 async def get_progress(task_id: str) -> dict:
-    """Get progress data from Redis or fallback to in-memory."""
-    if redis_client:
-        try:
-            data = await redis_client.get(f"progress:{task_id}")
-            if data:
-                return json.loads(data)
-        except Exception as e:
-            logger.warning(f"Redis get failed, using fallback: {str(e)}")
+    """Get progress data from Redis with decompression."""
+    if not redis_client:
+        raise RuntimeError("Redis client not initialized. Progress retrieval unavailable.")
+        
+    try:
+        # Get progress data
+        progress_data = await redis_client.get(f"progress:{task_id}")
+        if not progress_data:
+            return {}
+            
+        parsed_data = json.loads(progress_data)
+        
+        # Check for separate compressed result
+        if ENABLE_COMPRESSION:
+            compressed_result = await redis_client.get(f"result:{task_id}")
+            if compressed_result:
+                decompressed_result = gzip.decompress(compressed_result)
+                parsed_data["result"] = json.loads(decompressed_result.decode())
+                
+        return parsed_data
+        
+    except Exception as e:
+        logger.error(f"Redis get failed: {str(e)}")
+        raise RuntimeError(f"Failed to retrieve progress from Redis: {str(e)}")
+
+# Smart progress update tracking
+progress_batch = {}
+last_update_time = {}
+
+async def smart_update_progress(task_id: str, step: int, message: str, force: bool = False):
+    """Smart progress update that batches updates to reduce Redis load."""
+    current_time = time.time()
     
-    return progress_store.get(task_id, {})
+    # Always update local cache
+    progress_data = {
+        "current": step, 
+        "total": 100, 
+        "message": message, 
+        "timestamp": current_time
+    }
+    
+    # Store in batch for potential Redis update
+    progress_batch[task_id] = progress_data
+    
+    # Determine if we should update Redis
+    should_update = (
+        force or  # Force update (start/end/error)
+        step == 100 or  # Completion
+        step % (REDIS_BATCH_SIZE * 5) == 0 or  # Significant progress increment (every 25%)
+        (current_time - last_update_time.get(task_id, 0)) >= PROGRESS_UPDATE_INTERVAL  # Time threshold
+    )
+    
+    if should_update and task_id:
+        await set_progress(task_id, progress_data)
+        last_update_time[task_id] = current_time
+        logger.info(f"Task {task_id}: {step}% - {message}")
+        
+        # Clean up completed tasks from tracking dictionaries
+        if step == 100 or force and "Error" in message:
+            progress_batch.pop(task_id, None)
+            last_update_time.pop(task_id, None)
+
+async def cleanup_old_progress():
+    """Clean up old progress tracking data."""
+    current_time = time.time() 
+    cutoff_time = current_time - (REDIS_PROGRESS_TTL * 2)  # Double TTL for safety
+    
+    # Clean up old tracking data
+    old_tasks = [
+        task_id for task_id, timestamp in last_update_time.items() 
+        if timestamp < cutoff_time
+    ]
+    
+    for task_id in old_tasks:
+        progress_batch.pop(task_id, None)
+        last_update_time.pop(task_id, None)
+        
+        # Also clean up Redis keys if client is available
+        if redis_client:
+            try:
+                await redis_client.delete(f"progress:{task_id}", f"result:{task_id}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up Redis keys for {task_id}: {str(e)}")
+        
+    if old_tasks:
+        logger.info(f"Cleaned up {len(old_tasks)} old progress tracking entries")
 
 async def process_structural_chunking(request: StructuralBlockRequest, task_id: Optional[str] = None) -> StructuralBlockResponse:
         """
@@ -111,19 +224,23 @@ async def process_structural_chunking(request: StructuralBlockRequest, task_id: 
         if redis_client is None:
             await init_redis()
         
+        # Clean up old progress data periodically
+        await cleanup_old_progress()
+        
         start_time = time.time()
         progress = {"current": 0, "total": 100, "message": "Starting processing"}
         
-        async def update_progress(step: int, message: str):
+        async def update_progress(step: int, message: str, force: bool = False):
             progress["current"] = step
             progress["message"] = message
             progress["timestamp"] = time.time()
-            logger.info(f"Task {task_id}: {step}% - {message}")
+            
+            # Use smart progress updates to reduce Redis load
             if task_id:
-                await set_progress(task_id, {"current": step, "total": 100, "message": message, "timestamp": time.time()})
+                await smart_update_progress(task_id, step, message, force)
         
         # Wait for processing slot (queue management)
-        await update_progress(1, "Waiting in queue...")
+        await update_progress(1, "Waiting in queue...", force=True)
         await processing_queue.put(task_id)  # Add to queue
         
         try:
@@ -215,7 +332,7 @@ async def process_structural_chunking(request: StructuralBlockRequest, task_id: 
                     chunks = chunks[:request.return_chunk_limit]
                     logger.info(f"Limited to {len(chunks)} chunks")
                 
-                await update_progress(95, "Preparing response")
+                await update_progress(90, "Preparing response")
                 await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
                 
                 logger.info(f"Successfully processed {len(chunks)} chunks")
@@ -223,7 +340,7 @@ async def process_structural_chunking(request: StructuralBlockRequest, task_id: 
                 chunk_data = await parallel_process_chunks(chunks, task_id, update_progress)
                 
                 processing_time = time.time() - start_time
-                await update_progress(100, "Processing complete")
+                await update_progress(100, "Processing complete", force=True)
             
             response = StructuralBlockResponse(
                 status="success",
@@ -263,6 +380,10 @@ async def process_structural_chunking(request: StructuralBlockRequest, task_id: 
             progress["current"] = 0
             progress["message"] = f"Error: {str(e)}"
             logger.error(f"Error processing request: {str(e)}")
+            
+            # Force update Redis with error status
+            if task_id:
+                await smart_update_progress(task_id, 0, f"Error: {str(e)}", force=True)
             
             error_response = StructuralBlockResponse(
                 status="error",
@@ -306,14 +427,14 @@ async def stream_extract_text_from_file(file: UploadFile, file_extension: str, t
                 if not chunk:
                     break
                 
-                chunk_text = chunk.decode('utf-8')
+                chunk_text = chunk.decode('utf-8', errors='ignore')
                 content_chunks.append(chunk_text)
                 total_size += len(chunk)
                 chunk_count += 1
                 
                 # Update progress during streaming
                 progress_percent = min(15 + (chunk_count * 20) // 10, 40)  # Scale to 15-40%
-                update_progress(progress_percent, f"Streaming text chunk {chunk_count}")
+                await update_progress(progress_percent, f"Streaming text chunk {chunk_count}")
                 await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
             
             return ''.join(content_chunks)
@@ -321,11 +442,11 @@ async def stream_extract_text_from_file(file: UploadFile, file_extension: str, t
         # For binary files (PDF, DOCX, PPTX, etc.), read entire content first
         # then process in parallel if the extracted text is large
         else:
-            update_progress(18, "Reading complete file for processing")
+            await update_progress(18, "Reading complete file for processing")
             await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
             
             content = await file.read()
-            update_progress(25, f"Extracting text from {file_extension.upper()} file")
+            await update_progress(25, f"Extracting text from {file_extension.upper()} file")
             await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
             
             # Extract text from the complete file
@@ -407,26 +528,26 @@ async def parallel_split_text(text_content: str, text_splitter, task_id: Optiona
                 
                 # Update progress
                 progress_percent = 65 + int((completed / len(tasks)) * 15)  # Scale to 65-80%
-                update_progress(progress_percent, f"Split segment {completed}/{len(tasks)}")
+                await update_progress(progress_percent, f"Split segment {completed}/{len(tasks)}")
                 await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
         
         return segment_results
     else:
         # For smaller texts, split directly
-        update_progress(70, "Splitting text directly")
+        await update_progress(70, "Splitting text directly")
         await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
         
         loop = asyncio.get_event_loop()
         chunks = await loop.run_in_executor(None, text_splitter.split_text, text_content)
         
-        update_progress(80, "Text splitting completed")
+        await update_progress(80, "Text splitting completed")
         await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
         
         return chunks
 
 async def parallel_process_chunks(chunks: List[Document], task_id: Optional[str], update_progress) -> List[Dict]:
     """Process chunks in parallel to create response data."""
-    update_progress(90, f"Processing {len(chunks)} chunks in parallel")
+    await update_progress(90, f"Processing {len(chunks)} chunks in parallel")
     await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
     
     # Split chunks into batches for parallel processing
@@ -454,7 +575,7 @@ async def parallel_process_chunks(chunks: List[Document], task_id: Optional[str]
             
             # Update progress
             progress_percent = 90 + int((completed / len(tasks)) * 8)  # Scale to 90-98%
-            update_progress(progress_percent, f"Processed batch {completed}/{len(tasks)}")
+            await update_progress(progress_percent, f"Processed batch {completed}/{len(tasks)}")
             await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
     
     # Sort by original index
@@ -501,7 +622,7 @@ async def extract_text_from_file(file: UploadFile, file_extension: str) -> str:
         elif file_extension == '.xml':
             return extract_text_from_xml(content)
         elif file_extension == '.txt':
-            return content.decode('utf-8')
+            return content.decode('utf-8', errors='ignore')
         else:
             raise ValueError(f"Unsupported file type: {file_extension}")
 
